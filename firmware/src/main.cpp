@@ -1,12 +1,11 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <lvgl.h>
-#include <ArduinoJson.h>
-#include <esp_heap_caps.h>
-
 #include "data.h"
 #include "ui.h"
-#include "ble.h"
+#include "config.h"
+#include "wifi_manager.h"
+#include "api.h"
 #include "splash.h"
 #include "usage_rate.h"
 #include "idle.h"
@@ -19,9 +18,11 @@
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
 
-static UsageData usage = {};
+#define API_POLL_INTERVAL_MS 180000UL
 
-// ---- LVGL draw buffers (partial render mode) ----
+static UsageData usage = {};
+static bool force_api_refresh = false;
+
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
 // boards (e.g. ESP32-C6) allocate from internal SRAM, so we shrink the strip
 // — 480×20 RGB565 = 19 KB × 2 buffers = 38 KB, fits beside everything else.
@@ -66,19 +67,16 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
         static bool touch_was = false;
         static bool touch_wake_swallowed = false;
         if (raw_pressed && !touch_was) {
-            // Press edge — consume as wake if asleep.
             if (idle_consume_wake_press()) {
                 touch_wake_swallowed = true;
                 pressed = false;
             }
         } else if (!raw_pressed && touch_was) {
-            // Release edge.
             if (touch_wake_swallowed) {
                 touch_wake_swallowed = false;
                 pressed = false;
             }
         } else if (raw_pressed && touch_wake_swallowed) {
-            // Held finger through wake — keep hiding until release.
             pressed = false;
         }
         touch_was = raw_pressed;
@@ -95,46 +93,22 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, json);
-    if (err) {
-        Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
-    }
-
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->ok = doc["ok"] | false;
-    out->valid = true;
-    return true;
-}
-
 // ---- Serial command buffer ----
 #define CMD_BUF_SIZE 64
 static char cmd_buf[CMD_BUF_SIZE];
-static int cmd_pos = 0;
+static int  cmd_pos = 0;
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
-    // A full RGB565 framebuffer doesn't fit in internal SRAM on PSRAM-free
-    // boards (e.g. 480×480×2 = 460 KB). Capture is unsupported there.
     Serial.println("SCREENSHOT_UNSUPPORTED");
     return;
 #else
     const uint32_t w = board_caps().width;
     const uint32_t h = board_caps().height;
     const uint32_t row_bytes = w * 2;
-    const uint32_t buf_size = row_bytes * h;
+    const uint32_t buf_size  = row_bytes * h;
     uint8_t* sbuf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-    if (!sbuf) {
-        Serial.println("SCREENSHOT_ERR");
-        return;
-    }
+    if (!sbuf) { Serial.println("SCREENSHOT_ERR"); return; }
 
     lv_draw_buf_t draw_buf;
     lv_draw_buf_init(&draw_buf, w, h, LV_COLOR_FORMAT_RGB565, row_bytes, sbuf, buf_size);
@@ -178,6 +152,7 @@ extern "C" void board_init(void);
 
 void setup() {
     Serial.begin(115200);
+    setCpuFrequencyMhz(120);
     delay(300);
     Serial.println("{\"ready\":true}");
 
@@ -185,13 +160,12 @@ void setup() {
 
     display_hal_init();
     display_hal_begin();
-    idle_init();   // takes over brightness (DISPLAY_DEFAULT_BRIGHTNESS) and starts the idle timer
+    idle_init();
 
     power_hal_init();
     imu_hal_init();
     touch_hal_init();
 
-    // ---- LVGL ----
     const int W = board_caps().width;
     const int H = board_caps().height;
 
@@ -206,47 +180,38 @@ void setup() {
     lv_display_set_flush_cb(disp, my_flush_cb);
     lv_display_set_buffers(disp, buf1, buf2, W * BUF_LINES * 2,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
+
     lv_display_add_event_cb(disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, NULL);
 
     lv_indev_t* indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
-    ble_init();
     input_hal_init();
 
     ui_init();
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
 
-    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
+    config_init();
+    wifi_manager_init();
+    api_init();
+
+    Serial.printf("Dashboard ready (%s, %dx%d), connecting to WiFi...\n",
         board_caps().name, W, H);
 }
-
-static ble_state_t last_ble_state = BLE_STATE_INIT;
 
 void loop() {
     idle_tick();
     lv_timer_handler();
     ui_tick_anim();
-    ble_tick();
     power_hal_tick();
     imu_hal_tick();
     splash_tick();
-    // Rotation transition (blank + ramp) would fight the idle fade — skip
-    // ticks while the panel is dark. A rotation that happens during sleep
-    // is detected by the next tick after wake and ramped in then.
+    wifi_manager_tick();
+    config_server_tick();
     if (!idle_is_asleep()) display_hal_tick();
 
-    // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → cycle screens; on splash, cycle animations
-    // First press from sleep is consumed as a wake-only event by
-    // idle_consume_wake_press(); the normal action fires from the second
-    // press. Activity bookkeeping happens inside idle_consume_wake_press
-    // so no separate idle_note_activity() call is needed here.
     {
         static bool primary_was = false;
         static bool primary_wake_swallowed = false;
@@ -254,10 +219,8 @@ void loop() {
         if (primary_now != primary_was) {
             if (primary_now) {
                 if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             } else {
                 if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
             }
             primary_was = primary_now;
         }
@@ -269,10 +232,9 @@ void loop() {
             if (secondary_now != secondary_was) {
                 if (secondary_now) {
                     if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+                    else                           force_api_refresh = true;
                 } else {
                     if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
                 }
                 secondary_was = secondary_now;
             }
@@ -286,40 +248,78 @@ void loop() {
         }
     }
 
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+    {
+        static int  last_pct      = -2;
+        static bool last_charging = false;
+        int  pct      = power_hal_battery_pct();
+        bool charging = power_hal_is_charging();
+        if (pct != last_pct || charging != last_charging) {
+            last_pct = pct;
+            last_charging = charging;
+            ui_update_battery(pct, charging);
+        }
     }
 
-    static int  last_pct      = -2;
-    static bool last_charging = false;
-    int  pct      = power_hal_battery_pct();
-    bool charging = power_hal_is_charging();
-    if (pct != last_pct || charging != last_charging) {
-        last_pct = pct;
-        last_charging = charging;
-        ui_update_battery(pct, charging);
+    {
+        static bool     last_connected   = false;
+        static bool     server_started   = false;
+        static uint32_t last_wifi_update = 0;
+        bool     connected = wifi_is_connected();
+        uint32_t now       = millis();
+        if (connected && !server_started) {
+            server_started = true;
+            config_server_init();
+        }
+        if (connected && !last_connected) {
+            Serial.println("WiFi: connected, triggering fetch");
+            configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.cloudflare.com");
+        }
+        if (connected != last_connected || now - last_wifi_update > 5000) {
+            last_connected   = connected;
+            last_wifi_update = now;
+            ui_update_wifi_status(connected, wifi_ip_str(),
+                                  api_last_ok(), api_last_fetch_ms() > 0);
+        }
+    }
+
+    // Periodic API fetch every 60s (only when WiFi connected)
+    {
+        static uint32_t last_api_fetch = 0;
+        uint32_t now = millis();
+        if ((now - last_api_fetch >= API_POLL_INTERVAL_MS || last_api_fetch == 0 || force_api_refresh) && wifi_is_connected()) {
+            force_api_refresh = false;
+            last_api_fetch = now;
+            int g_before = usage_rate_group();
+            if (api_fetch(&usage)) {
+                usage_rate_sample(usage.session_pct);
+                int g_after = usage_rate_group();
+                if (g_after != g_before) {
+                    Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+                        g_before, g_after, usage.session_pct);
+                    if (splash_is_active()) splash_pick_for_current_rate();
+                }
+                ui_update(&usage);
+            }
+            ui_update_wifi_status(wifi_is_connected(), wifi_ip_str(),
+                                  api_last_ok(), api_last_fetch_ms() > 0);
+        }
+    }
+
+    {
+        static uint32_t last_time_update = 0;
+        uint32_t now = millis();
+        if (now - last_time_update >= 1000) {
+            last_time_update = now;
+            struct tm t;
+            if (getLocalTime(&t, 0)) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+                ui_update_time(buf);
+            }
+        }
     }
 
     check_serial_cmd();
-
-    if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
-            ble_send_ack();
-        } else {
-            ble_send_nack();
-        }
-    }
 
     delay(5);
 }

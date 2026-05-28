@@ -13,7 +13,7 @@ Two reference ports today:
 
 The shared code calls a small HAL (`firmware/src/hal/`) that each board implements: display, touch, input, power, IMU. Optional features are guarded by `BoardCaps` (runtime) and `BOARD_HAS_*` (compile-time) rather than `#ifdef BOARD_*`.
 
-Connects to a host daemon over BLE; daemon polls Anthropic API for usage data. This file is for future Claude Code sessions to bootstrap quickly. Read this first.
+Connects via WiFi to a local HTTP server that polls Anthropic API for usage data. No BLE data channel, no host daemon required. This file is for future Claude Code sessions to bootstrap quickly. Read this first.
 
 ## Hardware (critical pins)
 
@@ -22,7 +22,7 @@ Connects to a host daemon over BLE; daemon polls Anthropic API for usage data. T
 - Touch: **CST9220** via I2C (SDA=15, SCL=14, INT=11, addr=0x5A)
 - PMU: **AXP2101** on same I2C bus (addr=0x34) — battery, USB VBUS, PWR button IRQ
 - IMU: **QMI8658** on same I2C bus (addr=0x6B) — accelerometer for auto-rotation
-- Buttons: GPIO 0 (left → Space/voice-mode), GPIO 18 (right → Shift+Tab/mode-toggle), AXP PKEY (middle → cycle screens; on splash → cycle animations)
+- Buttons: AXP PKEY (middle → cycle screens; on splash → cycle animations). GPIO 0/18 (left/right) no longer used.
 
 ### AMOLED-1.8 (newer port)
 - Display: **SH8601** AMOLED via QSPI (CS=12, **SCLK=11** ← different!, SDIO0..3=4..7, RST routed via XCA9554 EXIO1)
@@ -49,9 +49,11 @@ firmware/src/
     waveshare_amoled_18/    — SH8601 + FT3168 + AXP + XCA9554 (PWR via EXIO4), no rotation
     template/               — copy this to bootstrap a new port
   main.cpp                  — setup() + loop(): HAL calls only, zero #ifdef BOARD_*
-  ui.{h,cpp}                — 3-screen UI (splash, usage, bluetooth). compute_layout() picks fonts/positions from board_caps() (responsive — current breakpoint: H >= 460 → large, else compact)
+  ui.{h,cpp}                — 3-screen UI (splash, usage, wifi). compute_layout() picks fonts/positions from board_caps() (responsive — current breakpoint: H >= 460 → large, else compact)
   splash.{h,cpp}            — 20×20 pixel-art engine. CELL = min(W,H)/20, centered.
-  ble.{h,cpp}               — NimBLE peripheral: custom data service + HID keyboard
+  api.{h,cpp}               — HTTP GET endpoint → parse JSON → UsageData
+  config.{h,cpp}            — NVS provisioning: AP+captive portal on first boot, stores SSID/pass/endpoint URL
+  wifi_manager.{h,cpp}      — WiFi STA connect + auto-reconnect
   data.h                    — UsageData struct
   icons.h                   — icon arrays. Battery (5×) are RGB565A8 with alpha; rest are raw RGB565.
   logo.h                    — 80×80 RGB565 logo
@@ -83,7 +85,7 @@ Device path differs by OS: `/dev/cu.usbmodem*` on macOS, `/dev/ttyACM0` on Linux
 
 The firmware ships a `screenshot` serial command that dumps the LVGL framebuffer. `./screenshot.sh out.png [port]` captures a PNG sized to the active display (480×480 or 368×448). **Use this on every UI iteration** — Read the PNG with the Read tool, verify the change visually, iterate. Script auto-picks the macOS/Linux default port and falls back to pio's bundled Python if pyserial isn't on the system Python.
 
-The boot screen is `SCREEN_SPLASH` and only advances on a physical button press, so a fresh flash will sit on the splash. To screenshot the screen you're actually editing without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to `SCREEN_USAGE` / `SCREEN_CONTROLLER` / `SCREEN_BLUETOOTH`, do your iteration, then revert before committing.
+The boot screen is `SCREEN_SPLASH` and only advances on a physical button press, so a fresh flash will sit on the splash. To screenshot the screen you're actually editing without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to `SCREEN_USAGE` / `SCREEN_WIFI`, do your iteration, then revert before committing.
 
 ## Critical gotchas
 
@@ -120,6 +122,7 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Recent session highlights
 
+- **WiFi migration (2026-05-28).** Replaced BLE data channel with WiFi HTTP polling. ESP32 now connects to a local server (captive portal on first boot for SSID/endpoint provisioning via NVS). New files: `api.{h,cpp}`, `config.{h,cpp}`, `wifi_manager.{h,cpp}`. Deleted: `ble.{h,cpp}`, bash daemon, systemd unit. Third screen renamed from Bluetooth → WiFi.
 - **Device-abstraction refactor (2026-05-18).** All board-conditional code moved out of shared files into `boards/<name>/` and behind a HAL in `hal/`. ~30 `#ifdef BOARD_*` blocks went to zero. UI is responsive via `compute_layout()` driven by `board_caps()`. New ports add a folder + a PlatformIO env — no shared file edits.
 - Added second board port: Waveshare AMOLED-1.8 (368×448 portrait, SH8601, FT3168, XCA9554 IO expander).
 - Migrated from Panlee SC01 Plus (480×320 IPS) to Waveshare 2.16" AMOLED (480×480 square). Full hardware/library swap.
@@ -129,18 +132,16 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 - All UI margins widened to 20px to clear the rounded display corners.
 - Battery icons converted to RGB565A8 alpha so they blend cleanly over the splash animations.
 
-## Daemon / host side
+## Host side / data source
 
-Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
+The ESP32 polls a local HTTP endpoint every 60s. On first boot (or after "Reconfigure WiFi" tap), it opens a captive-portal AP (`ClawdmeterSetup`) — connect with any device, browse to `192.168.4.1`, enter SSID + password + endpoint URL. Credentials persist in NVS.
 
-**Discovery & resilience:**
+Expected JSON response from the endpoint:
 
-- Connects by name (`"Claude Controller"`) on first run, caches resolved MAC at `~/.config/claude-usage-monitor/ble-address`. ESP32 BLE addresses are factory-burned per-chip, so swapping any board invalidates the cache.
-- On connect failure: cache is dropped AND device is removed from bluez (`bluetoothctl remove`) so the next scan won't re-pick a dead MAC. Multi-candidate scans pick `head -1` and let the failure cycle converge.
-- `POLL_INTERVAL=60`, `TICK=5`. Inner loop wakes every 5s to detect disconnects fast; polls Anthropic when 60s elapsed OR when ESP fires a refresh request.
+```json
+{"s": 42.5, "sr": 1800, "w": 71.0, "wr": 86400, "ok": true}
+```
 
-**GATT characteristics on service `4c41555a-...0001`:**
+Fields: `s` = session %, `sr` = session reset secs, `w` = weekly %, `wr` = weekly reset secs, `ok` = data valid.
 
-- `...0002` RX — daemon writes JSON usage payload here.
-- `...0003` TX — firmware notifies ack/nack (daemon doesn't subscribe).
-- `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).
+A minimal server script (`daemon/clawdmeter-server.py` or similar) can read the Anthropic OAuth token and serve this endpoint on the local machine.

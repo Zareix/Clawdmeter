@@ -1,11 +1,11 @@
 #include "ui.h"
 #include "splash.h"
 #include <lvgl.h>
+#include <Preferences.h>
 #include "logo.h"
 #include "icons.h"
 #include "hal/board_caps.h"
 
-// Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
 LV_FONT_DECLARE(font_tiempos_34);
 LV_FONT_DECLARE(font_styrene_48);
@@ -33,7 +33,7 @@ struct Layout {
     int16_t usage_bar_y;
     int16_t usage_reset_y;
 
-    // Bluetooth screen
+    // WiFi / status screen
     int16_t bt_info_panel_h;
     int16_t bt_reset_zone_h;
     const lv_font_t* bt_title_font;
@@ -87,7 +87,6 @@ static void compute_layout(const BoardCaps& c) {
     L.content_w = L.scr_w - 2 * L.margin;
 }
 
-// Anthropic brand palette — design tokens live in theme.h
 #include "theme.h"
 #define COL_BG        THEME_BG
 #define COL_PANEL     THEME_PANEL
@@ -112,18 +111,19 @@ static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_anim;
 
-// ---- Bluetooth screen widgets ----
-static lv_obj_t* ble_container;
-static lv_obj_t* lbl_ble_status;
-static lv_obj_t* lbl_ble_device;
-static lv_obj_t* lbl_ble_mac;
+// ---- WiFi/Status screen widgets ----
+static lv_obj_t* wifi_container;
+static lv_obj_t* lbl_wifi_status;
+static lv_obj_t* lbl_wifi_ip;
+static lv_obj_t* lbl_api_status;
 
-// ---- Battery indicator (shared, on top) ----
+// ---- Battery indicator (Settings screen only) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
-static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
+// ---- Time label (Usage screen only) ----
+static lv_obj_t* lbl_usage_time;
+static lv_image_dsc_t battery_dscs[5];
 
-// ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
 
@@ -133,14 +133,14 @@ static uint8_t anim_spinner_idx = 0;
 static uint8_t anim_phase = 0;
 static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
-#define ANIM_MSG_MS     4000
+#define ANIM_MSG_MS     30000
 
 static const char* const spinner_frames[] = {
     "\xC2\xB7", "\xE2\x9C\xBB", "\xE2\x9C\xBD",
     "\xE2\x9C\xB6", "\xE2\x9C\xB3", "\xE2\x9C\xA2",
 };
 #define SPINNER_COUNT 6
-#define SPINNER_PHASES (2 * (SPINNER_COUNT - 1))  // 10: ping-pong 0..5..0
+#define SPINNER_PHASES (2 * (SPINNER_COUNT - 1))
 
 static const uint16_t spinner_ms[SPINNER_COUNT] = {
     260, 130, 130, 130, 130, 260,
@@ -187,21 +187,22 @@ static lv_color_t pct_color(float pct) {
     return COL_GREEN;
 }
 
-static void format_reset_time(int mins, char* buf, size_t len) {
-    if (mins < 0) {
+static void format_reset_time(int secs, char* buf, size_t len) {
+    if (secs < 0) {
         snprintf(buf, len, "---");
-    } else if (mins < 60) {
-        snprintf(buf, len, "Resets in %dm", mins);
-    } else if (mins < 1440) {
-        snprintf(buf, len, "Resets in %dh %dm", mins / 60, mins % 60);
+    } else if (secs < 60) {
+        snprintf(buf, len, "Resets in %ds", secs);
+    } else if (secs < 3600) {
+        snprintf(buf, len, "Resets in %dm", secs / 60);
+    } else if (secs < 86400) {
+        snprintf(buf, len, "Resets in %dh %dm", secs / 3600, (secs % 3600) / 60);
     } else {
-        snprintf(buf, len, "Resets in %dd %dh", mins / 1440, (mins % 1440) / 60);
+        snprintf(buf, len, "Resets in %dd %dh", secs / 86400, (secs % 86400) / 3600);
     }
 }
 
-// Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
-static void ble_reset_click_cb(lv_event_t* e);
+static void wifi_reconfigure_click_cb(lv_event_t* e);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -332,65 +333,58 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
 }
 
-// ======== Bluetooth Screen ========
+// ======== WiFi / Status Screen ========
 
-static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = lv_obj_create(scr);
-    lv_obj_set_size(ble_container, L.scr_w, L.scr_h);
-    lv_obj_set_pos(ble_container, 0, 0);
-    lv_obj_set_style_bg_opa(ble_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_container, 0, 0);
-    lv_obj_set_style_pad_all(ble_container, 0, 0);
-    lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(ble_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+static void init_wifi_screen(lv_obj_t* scr) {
+    wifi_container = lv_obj_create(scr);
+    lv_obj_set_size(wifi_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(wifi_container, 0, 0);
+    lv_obj_set_style_bg_opa(wifi_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wifi_container, 0, 0);
+    lv_obj_set_style_pad_all(wifi_container, 0, 0);
+    lv_obj_clear_flag(wifi_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t* lbl_ble_title = lv_label_create(ble_container);
-    lv_label_set_text(lbl_ble_title, "Bluetooth");
-    lv_obj_set_style_text_font(lbl_ble_title, L.bt_title_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_title, COL_TEXT, 0);
-    lv_obj_align(lbl_ble_title, LV_ALIGN_TOP_MID, 16, L.title_y);
+    lv_obj_t* lbl_wifi_title = lv_label_create(wifi_container);
+    lv_label_set_text(lbl_wifi_title, "Settings");
+    lv_obj_set_style_text_font(lbl_wifi_title, L.bt_title_font, 0);
+    lv_obj_set_style_text_color(lbl_wifi_title, COL_TEXT, 0);
+    lv_obj_align(lbl_wifi_title, LV_ALIGN_TOP_MID, 16, L.title_y);
 
-    lv_obj_t* p_info = make_panel(ble_container, L.margin, L.content_y,
-                                  L.content_w, L.bt_info_panel_h);
+    lv_obj_t* p_conn = make_panel(wifi_container, L.margin, L.content_y, L.content_w, 120);
 
-    static lv_image_dsc_t icon_bt_dsc;
-    init_icon_dsc(&icon_bt_dsc, ICON_BLUETOOTH_W, ICON_BLUETOOTH_H, icon_bluetooth_data);
+    lbl_wifi_status = lv_label_create(p_conn);
+    lv_label_set_text(lbl_wifi_status, "Connecting...");
+    lv_obj_set_style_text_font(lbl_wifi_status, L.bt_status_font, 0);
+    lv_obj_set_style_text_color(lbl_wifi_status, COL_DIM, 0);
+    lv_obj_set_pos(lbl_wifi_status, 0, 0);
 
-    lv_obj_t* bt_img = lv_image_create(p_info);
-    lv_image_set_src(bt_img, &icon_bt_dsc);
-    lv_obj_set_pos(bt_img, 0, 0);
+    lbl_wifi_ip = lv_label_create(p_conn);
+    lv_label_set_text(lbl_wifi_ip, "IP: ---");
+    lv_obj_set_style_text_font(lbl_wifi_ip, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_wifi_ip, COL_DIM, 0);
+    lv_obj_set_pos(lbl_wifi_ip, 0, 64);
 
-    lbl_ble_status = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_status, "Initializing...");
-    lv_obj_set_style_text_font(lbl_ble_status, L.bt_status_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_status, 56, 2);
+    int api_y = L.content_y + 120 + 16;
+    lv_obj_t* p_api = make_panel(wifi_container, L.margin, api_y, L.content_w, 50);
 
-    lbl_ble_device = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_device, "Device: ---");
-    lv_obj_set_style_text_font(lbl_ble_device, L.bt_device_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_device, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_device, 0, 64);
+    lbl_api_status = lv_label_create(p_api);
+    lv_label_set_text(lbl_api_status, "Fetch: waiting...");
+    lv_obj_set_style_text_font(lbl_api_status, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_api_status, COL_DIM, 0);
+    lv_obj_set_pos(lbl_api_status, 0, 0);
 
-    lbl_ble_mac = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_mac, "Address: ---");
-    lv_obj_set_style_text_font(lbl_ble_mac, L.bt_device_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_mac, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_mac, 0, 100);
-
-    int reset_y = L.content_y + L.bt_info_panel_h + 16;
-    lv_obj_t* reset_zone = lv_obj_create(ble_container);
+    int reset_y = api_y + 50 + 16;
+    lv_obj_t* reset_zone = lv_obj_create(wifi_container);
     lv_obj_set_pos(reset_zone, L.margin, reset_y);
     lv_obj_set_size(reset_zone, L.content_w, L.bt_reset_zone_h);
     lv_obj_set_style_bg_color(reset_zone, COL_PANEL, 0);
     lv_obj_set_style_bg_opa(reset_zone, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(reset_zone, 8, 0);
     lv_obj_set_style_border_width(reset_zone, 0, 0);
-    lv_obj_set_style_pad_column(reset_zone, 14, 0);
     lv_obj_set_flex_flow(reset_zone, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(reset_zone, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(reset_zone, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(reset_zone, ble_reset_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(reset_zone, wifi_reconfigure_click_cb, LV_EVENT_CLICKED, NULL);
 
     static lv_image_dsc_t icon_trash_dsc;
     init_icon_dsc(&icon_trash_dsc, ICON_TRASH2_W, ICON_TRASH2_H, icon_trash2_data);
@@ -398,23 +392,11 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
     lv_image_set_src(trash_img, &icon_trash_dsc);
 
     lv_obj_t* reset_lbl = lv_label_create(reset_zone);
-    lv_label_set_text(reset_lbl, "Reset Bluetooth");
+    lv_label_set_text(reset_lbl, "Reconfigure WiFi");
     lv_obj_set_style_text_font(reset_lbl, L.bt_device_font, 0);
     lv_obj_set_style_text_color(reset_lbl, COL_DIM, 0);
 
-    lv_obj_t* lbl_credit = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit, "Built by @hermannbjorgvin");
-    lv_obj_set_style_text_font(lbl_credit, L.bt_credit_1_font, 0);
-    lv_obj_set_style_text_color(lbl_credit, COL_DIM, 0);
-    lv_obj_align(lbl_credit, LV_ALIGN_BOTTOM_MID, 0, -46);
-
-    lv_obj_t* lbl_credit2 = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit2, "Clawd animation by @amaanbuilds");
-    lv_obj_set_style_text_font(lbl_credit2, L.bt_credit_2_font, 0);
-    lv_obj_set_style_text_color(lbl_credit2, COL_DIM, 0);
-    lv_obj_align(lbl_credit2, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(wifi_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======== Public API ========
@@ -430,7 +412,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
-    init_bluetooth_screen(scr);
+    init_wifi_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -444,6 +426,15 @@ void ui_init(void) {
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
     lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
+
+    lbl_usage_time = lv_label_create(scr);
+    lv_label_set_text(lbl_usage_time, "--:--");
+    lv_obj_set_style_text_font(lbl_usage_time, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_usage_time, COL_DIM, 0);
+    lv_obj_set_size(lbl_usage_time, 90, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(lbl_usage_time, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(lbl_usage_time, L.scr_w - 90 - L.margin, L.title_y + 14);
+    lv_obj_add_flag(lbl_usage_time, LV_OBJ_FLAG_HIDDEN);
 }
 
 void ui_update(const UsageData* data) {
@@ -456,7 +447,7 @@ void ui_update(const UsageData* data) {
     lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
 
     char buf[48];
-    format_reset_time(data->session_reset_mins, buf, sizeof(buf));
+    format_reset_time(data->session_reset_secs, buf, sizeof(buf));
     lv_label_set_text(lbl_session_reset, buf);
 
     int w_pct = (int)(data->weekly_pct + 0.5f);
@@ -464,7 +455,7 @@ void ui_update(const UsageData* data) {
     lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
 
-    format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
+    format_reset_time(data->weekly_reset_secs, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
 }
 
@@ -493,32 +484,45 @@ void ui_tick_anim(void) {
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
+
 static void apply_battery_visibility(void) {
     if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    if (current_screen == SCREEN_WIFI) lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    else                               lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void apply_time_visibility(void) {
+    if (!lbl_usage_time) return;
+    if (current_screen == SCREEN_USAGE) lv_obj_clear_flag(lbl_usage_time, LV_OBJ_FLAG_HIDDEN);
+    else                                lv_obj_add_flag(lbl_usage_time, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    if (ui_get_current_screen() == SCREEN_WIFI) return;
+    ui_toggle_splash();
 }
 
-static void ble_reset_click_cb(lv_event_t* e) {
+static void wifi_reconfigure_click_cb(lv_event_t* e) {
     (void)e;
-    ble_clear_bonds();
+    Preferences prefs;
+    prefs.begin("clawdmeter", false);
+    prefs.clear();
+    prefs.end();
+    Serial.println("WiFi config cleared, rebooting...");
+    delay(500);
+    ESP.restart();
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(wifi_container,  LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
-    case SCREEN_SPLASH:     splash_show(); break;
-    case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SPLASH: splash_show(); break;
+    case SCREEN_USAGE:  lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_WIFI:   lv_obj_clear_flag(wifi_container,  LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -530,15 +534,11 @@ void ui_show_screen(screen_t screen) {
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_battery_visibility();
+    apply_time_visibility();
 }
 
 void ui_cycle_screen(void) {
-    screen_t next;
-    switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_BLUETOOTH; break;
-    case SCREEN_BLUETOOTH: next = SCREEN_USAGE;     break;
-    default:               next = SCREEN_USAGE;     break;
-    }
+    screen_t next = (current_screen == SCREEN_USAGE) ? SCREEN_WIFI : SCREEN_USAGE;
     ui_show_screen(next);
 }
 
@@ -551,36 +551,34 @@ screen_t ui_get_current_screen(void) {
     return current_screen;
 }
 
-void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    switch (state) {
-    case BLE_STATE_CONNECTED:
-        lv_label_set_text(lbl_ble_status, "Connected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_GREEN, 0);
-        break;
-    case BLE_STATE_ADVERTISING:
-        lv_label_set_text(lbl_ble_status, "Advertising...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_AMBER, 0);
-        break;
-    case BLE_STATE_DISCONNECTED:
-        lv_label_set_text(lbl_ble_status, "Disconnected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_RED, 0);
-        break;
-    default:
-        lv_label_set_text(lbl_ble_status, "Initializing...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-        break;
+void ui_update_wifi_status(bool connected, const char* ip, bool api_ok, bool api_ever) {
+    if (connected) {
+        lv_label_set_text(lbl_wifi_status, "Connected");
+        lv_obj_set_style_text_color(lbl_wifi_status, COL_GREEN, 0);
+    } else {
+        lv_label_set_text(lbl_wifi_status, "Connecting...");
+        lv_obj_set_style_text_color(lbl_wifi_status, COL_AMBER, 0);
     }
 
-    if (name) {
-        static char nbuf[48];
-        snprintf(nbuf, sizeof(nbuf), "Device: %s", name);
-        lv_label_set_text(lbl_ble_device, nbuf);
+    static char ip_buf[32];
+    snprintf(ip_buf, sizeof(ip_buf), "IP: %s", ip ? ip : "---");
+    lv_label_set_text(lbl_wifi_ip, ip_buf);
+
+    if (!api_ever) {
+        lv_label_set_text(lbl_api_status, "Fetch: waiting...");
+        lv_obj_set_style_text_color(lbl_api_status, COL_DIM, 0);
+    } else if (api_ok) {
+        lv_label_set_text(lbl_api_status, "Fetch: OK");
+        lv_obj_set_style_text_color(lbl_api_status, COL_GREEN, 0);
+    } else {
+        lv_label_set_text(lbl_api_status, "Fetch: error");
+        lv_obj_set_style_text_color(lbl_api_status, COL_RED, 0);
     }
-    if (mac) {
-        static char mbuf[48];
-        snprintf(mbuf, sizeof(mbuf), "Address: %s", mac);
-        lv_label_set_text(lbl_ble_mac, mbuf);
-    }
+}
+
+void ui_update_time(const char* time_str) {
+    if (!lbl_usage_time) return;
+    lv_label_set_text(lbl_usage_time, time_str);
 }
 
 void ui_update_battery(int percent, bool charging) {
